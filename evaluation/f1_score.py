@@ -26,7 +26,7 @@ def eval_junctions(distances, thresholds=5):
     num_gts, num_preds = distances.shape
 
     # filter the matches between ceiling-wall and floor-wall junctions
-    mask = np.zeros_like(distances, dtype=np.bool)
+    mask = np.zeros_like(distances, dtype=np.bool_)
     mask[:num_gts//2, :num_preds//2] = True
     mask[num_gts//2:, num_preds//2:] = True
     distances[~mask] = np.inf

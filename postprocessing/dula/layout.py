@@ -162,7 +162,7 @@ def fit_layout(floor_xz, need_cube=False, show=False, block_eps=5):
         else:
             pred_polys = pred_polys[0]
 
-    pred_polys.sort(key=lambda x: cv2.contourArea(x), reverse=True)
+    pred_polys = sorted(pred_polys, key=lambda x: cv2.contourArea(x), reverse=True)
     pred_poly = pred_polys[0]
     # findContours may produce errors, which are enforced here 
     for i in range(len(pred_poly)):

@@ -10,7 +10,17 @@ import sys
 import numpy as np
 from scipy.ndimage import map_coordinates
 import cv2
-from pylsd import lsd
+# pylsd 在 Apple Silicon 上无预编译动态库，改用 OpenCV 的 LSD（同为 IPOL LSD 实现）
+_cv2_lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD, 0.8, 0.6, 0.7)
+
+
+def lsd(img, quant=0.7):
+    lines, widths, _, _ = _cv2_lsd.detect(img)
+    if lines is None:
+        return None
+    lines = lines.reshape(-1, 4)
+    widths = widths.reshape(-1, 1)
+    return np.concatenate([lines, widths], axis=1)
 
 
 def computeUVN(n, in_, planeID):

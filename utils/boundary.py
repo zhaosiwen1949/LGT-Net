@@ -273,7 +273,7 @@ def get_heat_map(u_s, patch_num=256, sigma=2, window_width=15, show=False):
     gauss_map = get_gauss_map(sigma, window_width)
     heat_map_all = []
     for u in pixel_us:
-        heat_map = np.zeros(patch_num, dtype=np.float)
+        heat_map = np.zeros(patch_num, dtype=np.float64)
         left = u-window_width
         right = u+window_width+1
 

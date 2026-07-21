@@ -3,12 +3,14 @@
 @time: 2022/05/25
 @description: reference: https://github.com/sunset1995/PanoPlane360/blob/main/vis_planes.py
 """
-import open3d
 import numpy as np
 from utils.conversion import pixel2lonlat
 
 
 def create_3d_obj(img, depth, save_path=None, mesh=True, mesh_show_back_face=False, show=False):
+    # 延迟导入：open3d 与 torch 各自捆绑 libomp，同时加载会在 macOS 上崩溃，
+    # 仅在需要 3D 输出时才导入
+    import open3d
     assert img.shape[0] == depth.shape[0], ""
     h = img.shape[0]
     w = img.shape[1]

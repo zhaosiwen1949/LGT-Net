@@ -230,13 +230,13 @@ def visualization(segments: np.array, output_polygon: np.array, center: np.array
     board = np.zeros((side_l, side_l))
     for segment in segments:
         segment = (segment - origin) * scale + origin
-        segment = segment.astype(np.int)
+        segment = segment.astype(np.int64)
         cv2.line(board, tuple(segment[0]), tuple(segment[1]), 0.5, thickness=3)
-    board = cv2.drawMarker(board, tuple(origin.astype(np.int)), 1, thickness=3)
+    board = cv2.drawMarker(board, tuple(origin.astype(np.int64)), 1, thickness=3)
 
     output_polygon = (output_polygon - origin) * scale + origin
-    board = cv2.drawContours(board, [output_polygon.astype(np.int)], 0, 1, 3)
-    board = cv2.drawMarker(board, tuple(origin.astype(np.int)), 1, thickness=3)
+    board = cv2.drawContours(board, [output_polygon.astype(np.int64)], 0, 1, 3)
+    board = cv2.drawMarker(board, tuple(origin.astype(np.int64)), 1, thickness=3)
     plt.axis('off')
     plt.imshow(board)
     plt.show()
