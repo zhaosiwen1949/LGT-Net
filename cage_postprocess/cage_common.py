@@ -45,6 +45,16 @@ def ps_to_world(xy, yaw_deg, up_axis, height=0.0):
     return reordered[:, inverse_perm(up_axis)]
 
 
+def world_to_ps(xz, yaw_deg):
+    '''Original-world plan coords [N,2] -> CAGE ps floor-plane corners [N,2].
+
+    Exact planar inverse of ps_to_world: the up-axis reorder maps ps columns
+    (0, 1) onto the world plan columns plan_axes(up_axis) unchanged, so only
+    the yaw rotation needs undoing (rotate by +yaw_deg).
+    '''
+    return undo_yaw(xz, -yaw_deg)
+
+
 def plan_axes(up_axis):
     '''Original-frame column indices of the floor plane, in reorder order.
 
@@ -94,6 +104,63 @@ def load_cage(json_path):
     return {'rooms_xz': rooms_xz, 'centroids': np.asarray(centroids),
             'y_floor': y_floor, 'y_ceil': y_ceil,
             'norm': norm, 'yaw': yaw, 'up_axis': up_axis, 'raw': data}
+
+
+def pixel_to_ps(cols, rows, norm):
+    '''CAGE density-map pixels -> ps-frame meters (MVS: unit_scale = 1).
+
+    Mirrors CAGE eval_floorplan.pixel_to_metres: each axis is normalized to
+    [0, 255] independently and `hflip` mirrored only the image, so a flipped
+    map decodes col as 255 - col.
+    '''
+    mn = np.asarray(norm['min_coords'], dtype=np.float64)
+    mx = np.asarray(norm['max_coords'], dtype=np.float64)
+    cols = np.asarray(cols, dtype=np.float64)
+    rows = np.asarray(rows, dtype=np.float64)
+    if bool(norm.get('hflip', False)):
+        cols = 255. - cols
+    return np.stack([mn[0] + (cols / 255.) * (mx[0] - mn[0]),
+                     mn[1] + (rows / 255.) * (mx[1] - mn[1])], axis=1)
+
+
+def ps_to_pixel(xy, norm):
+    '''ps-frame meters [N,2] -> float density-map pixels (col, row) [N,2].'''
+    mn = np.asarray(norm['min_coords'], dtype=np.float64)
+    mx = np.asarray(norm['max_coords'], dtype=np.float64)
+    xy = np.asarray(xy, dtype=np.float64)
+    cols = (xy[:, 0] - mn[0]) / (mx[0] - mn[0]) * 255.
+    if bool(norm.get('hflip', False)):
+        cols = 255. - cols
+    rows = (xy[:, 1] - mn[1]) / (mx[1] - mn[1]) * 255.
+    return np.stack([cols, rows], axis=1)
+
+
+def ps_pixel_step(norm, axis):
+    '''ps meters spanned by one pixel along ps axis 0 (col) / 1 (row).'''
+    mn, mx = norm['min_coords'], norm['max_coords']
+    return (mx[axis] - mn[axis]) / 255.
+
+
+def openings_xz(cage, include_undecided=True):
+    '''CAGE openings -> [(kind, [[x1,z1],[x2,z2]])] in the original world plan
+    frame. `axis == 'x'` means a wall on a fixed column spanning rows.'''
+    raw, norm, yaw = cage['raw'], cage['norm'], cage['yaw']
+    up = cage['up_axis']
+    ax, az = plan_axes(up)
+    out = []
+    groups = [('opening', raw.get('openings', []))]
+    if include_undecided:
+        groups.append(('undecided', raw.get('openings_undecided', [])))
+    for kind, ops in groups:
+        for op in ops:
+            s, e = op['span']
+            if op['axis'] == 'x':
+                px = pixel_to_ps([op['line'], op['line']], [s, e], norm)
+            else:
+                px = pixel_to_ps([s, e], [op['line'], op['line']], norm)
+            w = ps_to_world(px, yaw, up)[:, [ax, az]]
+            out.append((op.get('type', kind), w))
+    return out
 
 
 def _poly_centroid(xz):

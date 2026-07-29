@@ -253,29 +253,56 @@ def sample_points(shrunk, center, n_samples, jitter, rng):
     return pts
 
 
-def render_viewpoints_png(cage, rooms_out, path):
+def render_viewpoints_png(cage, rooms_out, path, traj_xz=None,
+                          extra_clusters=(), title_suffix=''):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib import cm
-    fig, ax = plt.subplots(figsize=(11, 11))
+    fig, ax = plt.subplots(figsize=(12, 12))
+    if traj_xz is not None:
+        ax.plot(traj_xz[:, 0], traj_xz[:, 1], '.', color='0.82', ms=1.5,
+                zorder=1, label='trajectory (%d frames)' % len(traj_xz))
     for rid, xz in enumerate(cage['rooms_xz']):
         c = cm.tab20(rid % 20)
-        ax.fill(*np.vstack([xz, xz[:1]]).T, facecolor=c, alpha=0.15, zorder=1)
-        ax.plot(*np.vstack([xz, xz[:1]]).T, color=c, lw=1.8, zorder=2)
+        no_cov = any(r['id'] == rid and r.get('no_coverage')
+                     for r in rooms_out)
+        ax.fill(*np.vstack([xz, xz[:1]]).T, facecolor=c, alpha=0.15,
+                hatch='///' if no_cov else None, edgecolor=c, zorder=2)
+        ax.plot(*np.vstack([xz, xz[:1]]).T, color=c, lw=1.8, zorder=3)
         cen = cage['centroids'][rid]
-        ax.text(cen[0], cen[1], str(rid), fontsize=13, fontweight='bold',
-                ha='center', va='center', zorder=5)
+        label = str(rid) + (' (no coverage)' if no_cov else '')
+        ax.text(cen[0], cen[1], label, fontsize=12, fontweight='bold',
+                color='crimson' if no_cov else 'k',
+                ha='center', va='center', zorder=6)
     for room in rooms_out:
         c = cm.tab20(room['id'] % 20)
         for fr in room['frames']:
-            ax.plot(fr['xz'][0], fr['xz'][1], 'o', color=c, ms=4, mec='k',
-                    mew=0.4, zorder=4)
+            ax.plot(fr['xz'][0], fr['xz'][1], 'o', color=c, ms=5, mec='k',
+                    mew=0.5, zorder=5)
+            ax.annotate(fr['frame'], fr['xz'], fontsize=5, color='0.35',
+                        zorder=6, xytext=(3, 3), textcoords='offset points')
+    for cl in extra_clusters:
+        hull = np.asarray(cl['hull_xz'])
+        ax.plot(*np.vstack([hull, hull[:1]]).T, color='0.25', lw=1.6,
+                ls='--', zorder=4)
+        hc = hull.mean(axis=0)
+        ax.text(hc[0], hc[1], '%s (%d frames)' % (cl['id'], cl['n_frames']),
+                fontsize=11, fontweight='bold', color='0.15', ha='center',
+                va='center', zorder=6)
+        for fr in cl['frames']:
+            ax.plot(fr['xz'][0], fr['xz'][1], 's', color='0.3', ms=5,
+                    mec='k', mew=0.5, zorder=5)
+            ax.annotate(fr['frame'], fr['xz'], fontsize=5, color='0.35',
+                        zorder=6, xytext=(3, 3), textcoords='offset points')
     ax.set_aspect('equal')
     ax.invert_yaxis()
     ax.set_xlabel('world X (m)')
     ax.set_ylabel('world Z (m)')
-    ax.set_title('virtual pano viewpoints on CAGE rooms (top-down)')
+    ax.set_title('virtual pano viewpoints on CAGE rooms (top-down)%s'
+                 % title_suffix)
+    if traj_xz is not None:
+        ax.legend(loc='lower right', fontsize=9)
     ax.grid(True, color='0.92', zorder=0)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -283,34 +310,9 @@ def render_viewpoints_png(cage, rooms_out, path):
     print('[gsplat-cam] viewpoints -> %s' % path)
 
 
-def build_all(args):
-    '''Run checks + sampling + pose construction; return everything in memory.'''
-    ddir = args.dataset_dir
-    cage_json = args.cage_json or find_cage_json(ddir)
-    cage = cc.load_cage(cage_json)
-    print('[gsplat-cam] CAGE json: %s (%d rooms, yaw %.1f deg)'
-          % (cage_json, len(cage['rooms_xz']), cage['yaw']))
-
-    sparse_dir = os.path.join(ddir, 'sparse', '0')
-    xyz = load_points3d_cached(
-        os.path.join(sparse_dir, 'points3D.bin'),
-        os.path.join(sparse_dir, 'points3d_cache.npz'))
-    cc.check_same_world(xyz, cage['norm'])
-    ply_path = os.path.join(ddir, 'point_cloud.ply')
-    check_gaussian_world(ply_path, xyz, inside_min=args.inside_min)
-
-    all_xz = np.vstack(cage['rooms_xz'])
-    region_xz = (all_xz[:, 0].min(), all_xz[:, 1].min(),
-                 all_xz[:, 0].max(), all_xz[:, 1].max())
-    floor_y, ceil_y = measure_gaussian_planes(ply_path, region_xz)
-
-    theta = plan_axis_theta(cage)
-    R_c2w = cam_to_world(theta)
-    cam_y = floor_y - args.height          # up is -Y: subtract to rise
-    print('[gsplat-cam] pano heading theta=%.2f deg (CAGE wall axis), camera '
-          'y=%.3f (gaussian floor %.3f - %.2f up; CAGE floor %.3f for reference)'
-          % (theta, cam_y, floor_y, args.height, cage['y_floor']))
-
+def sample_grid(cage, theta, args):
+    '''Original sampler: shrink polygon -> ~cell_area subregions -> centre +
+    jittered points. Returns (views, rooms_out).'''
     from shapely.geometry import Polygon
     rng = np.random.default_rng(0)
     views, rooms_out = [], []
@@ -344,15 +346,174 @@ def build_all(args):
                           'frames': frames})
         print('  room %2d: area %5.1f m2 -> %d center(s), %d views'
               % (rid, poly.area, len(centers), len(frames)))
+    return views, rooms_out
+
+
+def sample_trajectory(cage, floor_y, args):
+    '''Trajectory sampler: reachable viewpoints from the real sparse/0 camera
+    track. Returns (views, rooms_out, extra_clusters, traj_xz).'''
+    import traj_sampling as ts
+    from shapely.geometry import Polygon
+
+    sparse_dir = os.path.join(args.dataset_dir, 'sparse', '0')
+    cross = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), '..', 'uLayout', 'src',
+        os.path.basename(os.path.normpath(args.dataset_dir)),
+        'camera_poses.json')
+    names, C = ts.load_trajectory(sparse_dir,
+                                  cross_check_json=os.path.normpath(cross))
+    traj_xz = C[:, [0, 2]]
+
+    room_polys = [Polygon(xz).buffer(0) for xz in cage['rooms_xz']]
+    cls = ts.classify_frames(C, room_polys, floor_y,
+                             h_band=tuple(args.h_band),
+                             boundary_margin=args.boundary_margin)
+    op_xz = [seg for _, seg in cc.openings_xz(cage)]
+    if args.opening_clear > 0:
+        print('  keeping picks >= %.2f m clear of %d CAGE openings'
+              % (args.opening_clear, len(op_xz)))
+
+    views, rooms_out = [], []
+    for rid, poly in enumerate(room_polys):
+        members = cls['room_members_hok'][rid]
+        if len(members) == 0 and len(cls['room_members'][rid]) > 0:
+            print('  room %2d: no frames in height band, relaxing to all %d '
+                  'in-room frames' % (rid, len(cls['room_members'][rid])))
+            members = cls['room_members'][rid]
+        frames = []
+        clusters = ts.sample_room(poly, traj_xz, members,
+                                  cell_area=args.cell_area,
+                                  per_cluster=args.samples_per_center,
+                                  wall_clear=args.wall_clear,
+                                  min_clusters=args.min_clusters,
+                                  min_cluster_area=args.min_cluster_area,
+                                  openings=op_xz,
+                                  opening_clear=args.opening_clear)
+        for cl in clusters:
+            for sid, fi in enumerate(cl['picks']):
+                name = 'r%02d_c%d_s%d' % (rid, cl['center_id'], sid)
+                p = traj_xz[fi]
+                views.append({'name': name, 'room_id': rid,
+                              'center_id': cl['center_id'],
+                              'xz': [round(float(p[0]), 3),
+                                     round(float(p[1]), 3)]})
+                d = float(np.hypot(p[0] - cage['centroids'][rid][0],
+                                   p[1] - cage['centroids'][rid][1]))
+                frames.append({'frame': name,
+                               'xz': [round(float(p[0]), 3),
+                                      round(float(p[1]), 3)],
+                               'dist_centroid': round(d, 2), 'inside': True,
+                               'h_floor': args.height,
+                               'src_frame': names[fi],
+                               'clearance_relaxed': cl['clearance_relaxed'],
+                               'opening_relaxed': cl.get('opening_relaxed',
+                                                         False)})
+        rooms_out.append({'id': rid,
+                          'centroid_xz': [round(float(v), 3)
+                                          for v in cage['centroids'][rid]],
+                          'poly_xz': np.round(cage['rooms_xz'][rid], 3).tolist(),
+                          'fallback_outside': False,
+                          'no_coverage': len(frames) == 0,
+                          'n_centers': len(clusters),
+                          'frames': frames})
+        tagtxt = '  ** NO COVERAGE (no trajectory frames in room)' \
+            if not frames else ''
+        print('  room %2d: area %5.1f m2, %4d traj frames -> %d cluster(s), '
+              '%d views%s' % (rid, poly.area, len(members), len(clusters),
+                              len(frames), tagtxt))
+
+    # suspected rooms CAGE missed: dense trajectory clusters outside all rooms
+    accepted, rejected = ts.find_missing_clusters(
+        traj_xz, cls['outside_idx'], eps=args.dbscan_eps,
+        min_samples=args.dbscan_min_samples,
+        min_frames=args.cluster_min_frames,
+        min_hull_area=args.cluster_min_hull)
+    for rej in rejected:
+        print('  outside cluster rejected: %d frames, hull %.1f m2 (need '
+              '>=%d frames and >=%.1f m2)'
+              % (rej['n_frames'], rej['hull_area'],
+                 args.cluster_min_frames, args.cluster_min_hull))
+    extra_clusters = []
+    for uid, cl in enumerate(accepted):
+        hull_poly = Polygon(cl['hull_xz'])
+        clusters = ts.sample_room(hull_poly, traj_xz, cl['member_idx'],
+                                  cell_area=args.cell_area,
+                                  per_cluster=args.samples_per_center,
+                                  wall_clear=0.0)   # no CAGE walls to honour
+        frames = []
+        for sub in clusters:
+            for sid, fi in enumerate(sub['picks']):
+                name = 'u%02d_c%d_s%d' % (uid, sub['center_id'], sid)
+                p = traj_xz[fi]
+                views.append({'name': name, 'room_id': -1,
+                              'cluster': 'u%02d' % uid,
+                              'center_id': sub['center_id'],
+                              'xz': [round(float(p[0]), 3),
+                                     round(float(p[1]), 3)]})
+                frames.append({'frame': name,
+                               'xz': [round(float(p[0]), 3),
+                                      round(float(p[1]), 3)],
+                               'src_frame': names[fi],
+                               'h_floor': args.height})
+        extra_clusters.append({'id': 'u%02d' % uid,
+                               'hull_xz': np.round(cl['hull_xz'], 3).tolist(),
+                               'hull_area_m2': cl['hull_area'],
+                               'n_frames': cl['n_frames'],
+                               'n_centers': len(clusters),
+                               'frames': frames})
+        print('  MISSING-ROOM cluster u%02d: %d traj frames, hull %.1f m2 -> '
+              '%d views' % (uid, cl['n_frames'], cl['hull_area'], len(frames)))
+    return views, rooms_out, extra_clusters, traj_xz
+
+
+def build_all(args):
+    '''Run checks + sampling + pose construction; return everything in memory.'''
+    ddir = args.dataset_dir
+    cage_json = args.cage_json or find_cage_json(ddir)
+    cage = cc.load_cage(cage_json)
+    print('[gsplat-cam] CAGE json: %s (%d rooms, yaw %.1f deg)'
+          % (cage_json, len(cage['rooms_xz']), cage['yaw']))
+
+    sparse_dir = os.path.join(ddir, 'sparse', '0')
+    xyz = load_points3d_cached(
+        os.path.join(sparse_dir, 'points3D.bin'),
+        os.path.join(sparse_dir, 'points3d_cache.npz'))
+    cc.check_same_world(xyz, cage['norm'])
+    ply_path = os.path.join(ddir, 'point_cloud.ply')
+    check_gaussian_world(ply_path, xyz, inside_min=args.inside_min)
+
+    all_xz = np.vstack(cage['rooms_xz'])
+    region_xz = (all_xz[:, 0].min(), all_xz[:, 1].min(),
+                 all_xz[:, 0].max(), all_xz[:, 1].max())
+    floor_y, ceil_y = measure_gaussian_planes(ply_path, region_xz)
+
+    theta = plan_axis_theta(cage)
+    R_c2w = cam_to_world(theta)
+    cam_y = floor_y - args.height          # up is -Y: subtract to rise
+    print('[gsplat-cam] pano heading theta=%.2f deg (CAGE wall axis), camera '
+          'y=%.3f (gaussian floor %.3f - %.2f up; CAGE floor %.3f for reference)'
+          % (theta, cam_y, floor_y, args.height, cage['y_floor']))
+
+    extra_clusters, traj_xz = [], None
+    if args.sampler == 'trajectory':
+        views, rooms_out, extra_clusters, traj_xz = sample_trajectory(
+            cage, floor_y, args)
+    else:
+        views, rooms_out = sample_grid(cage, theta, args)
 
     return {'cage': cage, 'cage_json': cage_json, 'theta': theta,
             'R_c2w': R_c2w, 'cam_y': cam_y, 'floor_y': floor_y,
-            'ceil_y': ceil_y, 'views': views, 'rooms_out': rooms_out}
+            'ceil_y': ceil_y, 'views': views, 'rooms_out': rooms_out,
+            'extra_clusters': extra_clusters, 'traj_xz': traj_xz,
+            'sampler': args.sampler}
 
 
 def verify(built, ddir):
     '''Compare the in-memory result against the copied gsplat_render jsons.'''
     out_dir = os.path.join(ddir, 'gsplat_render')
+    if built['sampler'] == 'trajectory':
+        print('[verify] trajectory sampler: view-set/xz checks skipped '
+              '(reference gsplat_render is grid-sampled); meta-only verify')
     ref_cams = json.load(open(os.path.join(out_dir, 'cameras.json')))
     ref_poses = json.load(open(os.path.join(out_dir,
                                             'virtual_camera_poses.json')))
@@ -383,25 +544,28 @@ def verify(built, ddir):
     print('  [%s] shared R/qvec     max|dR| %.2e  max|dq| %.2e'
           % ('OK' if good else 'FAIL', dR, dq))
 
-    names_new = {v['name'] for v in built['views']}
-    names_ref = {v['name'] for v in ref_cams['views']}
-    good = names_new == names_ref and len(built['views']) == len(ref_cams['views'])
-    ok = ok and good
-    print('  [%s] view set           %d generated vs %d reference%s'
-          % ('OK' if good else 'FAIL', len(built['views']),
-             len(ref_cams['views']),
-             '' if good else ' (diff: %s)' % sorted(names_new ^ names_ref)[:6]))
+    if built['sampler'] != 'trajectory':
+        names_new = {v['name'] for v in built['views']}
+        names_ref = {v['name'] for v in ref_cams['views']}
+        good = (names_new == names_ref
+                and len(built['views']) == len(ref_cams['views']))
+        ok = ok and good
+        print('  [%s] view set           %d generated vs %d reference%s'
+              % ('OK' if good else 'FAIL', len(built['views']),
+                 len(ref_cams['views']),
+                 '' if good else ' (diff: %s)'
+                 % sorted(names_new ^ names_ref)[:6]))
 
-    # soft check: sampled xz positions (shapely version differences may shift
-    # representative_point / jitter acceptance -- report only, copied
-    # cameras.json stays authoritative because the renders correspond to it)
-    ref_xz = {v['name']: v['xz'] for v in ref_cams['views']}
-    d = [float(np.hypot(v['xz'][0] - ref_xz[v['name']][0],
-                        v['xz'][1] - ref_xz[v['name']][1]))
-         for v in built['views'] if v['name'] in ref_xz]
-    if d:
-        print('  [soft] sampled xz deviation: max %.4f m, mean %.4f m '
-              '(informative only)' % (max(d), float(np.mean(d))))
+        # soft check: sampled xz positions (shapely version differences may
+        # shift representative_point / jitter acceptance -- report only, the
+        # copied cameras.json stays authoritative (renders correspond to it)
+        ref_xz = {v['name']: v['xz'] for v in ref_cams['views']}
+        d = [float(np.hypot(v['xz'][0] - ref_xz[v['name']][0],
+                            v['xz'][1] - ref_xz[v['name']][1]))
+             for v in built['views'] if v['name'] in ref_xz]
+        if d:
+            print('  [soft] sampled xz deviation: max %.4f m, mean %.4f m '
+                  '(informative only)' % (max(d), float(np.mean(d))))
 
     if not ok:
         raise SystemExit('[verify] FAILED: generated cameras disagree with the '
@@ -409,14 +573,50 @@ def verify(built, ddir):
     print('[verify] PASSED: same world, same shared pose, same view set')
 
 
+def view_names(built):
+    return sorted(v['name'] for v in built['views'])
+
+
+def write_plan_only(built, ddir, args):
+    '''Write only the preview png + selection draft for user confirmation.'''
+    out_dir = os.path.join(ddir, args.out_name)
+    os.makedirs(out_dir, exist_ok=True)
+    draft = {'sampler': built['sampler'],
+             'view_names': view_names(built),
+             'num_views': len(built['views']),
+             'rooms': built['rooms_out'],
+             'extra_clusters': built['extra_clusters']}
+    with open(os.path.join(out_dir, 'selection_draft.json'), 'w') as f:
+        json.dump(draft, f, indent=2)
+    render_viewpoints_png(built['cage'], built['rooms_out'],
+                          os.path.join(out_dir, 'viewpoints_preview.png'),
+                          traj_xz=built['traj_xz'],
+                          extra_clusters=built['extra_clusters'],
+                          title_suffix=' [PLAN PREVIEW - not final]')
+    print('[gsplat-cam] plan-only: %d views (draft) -> %s/'
+          '{viewpoints_preview.png, selection_draft.json}\n'
+          'review the preview, then re-run WITHOUT --plan-only to write the '
+          'final cameras/poses/selection' % (len(built['views']), out_dir))
+
+
 def write_outputs(built, ddir, args):
-    out_dir = os.path.join(ddir, 'gsplat_render')
+    out_dir = os.path.join(ddir, args.out_name)
     os.makedirs(out_dir, exist_ok=True)
     for fn in ('cameras.json', 'virtual_camera_poses.json', 'selection.json'):
         if os.path.exists(os.path.join(out_dir, fn)) and not args.force:
             raise SystemExit('%s exists; pass --force to overwrite (the '
                              'renders/ were made from the existing cameras)'
                              % os.path.join(out_dir, fn))
+    draft_path = os.path.join(out_dir, 'selection_draft.json')
+    if os.path.isfile(draft_path):
+        draft = json.load(open(draft_path))
+        if draft.get('view_names') != view_names(built):
+            raise SystemExit(
+                'view set differs from the confirmed selection_draft.json '
+                '(parameters changed between --plan-only and this run?). '
+                'Re-run --plan-only and confirm again, or delete the draft.')
+        print('[gsplat-cam] view set matches the confirmed draft (%d views)'
+              % len(built['views']))
 
     theta, cam_y = built['theta'], built['cam_y']
     cameras = {'meta': {
@@ -441,12 +641,14 @@ def write_outputs(built, ddir, args):
     for v in built['views']:
         c = np.array([v['xz'][0], cam_y, v['xz'][1]])
         tvec = -R_w2c @ c
-        cameras['views'].append({
-            'name': v['name'], 'room_id': v['room_id'],
-            'center_id': v['center_id'], 'xz': v['xz'],
-            'camtoworld': np.round(np.vstack([
-                np.hstack([built['R_c2w'], c[:, None]]),
-                [0, 0, 0, 1]]), 8).tolist()})
+        view = {'name': v['name'], 'room_id': v['room_id'],
+                'center_id': v['center_id'], 'xz': v['xz'],
+                'camtoworld': np.round(np.vstack([
+                    np.hstack([built['R_c2w'], c[:, None]]),
+                    [0, 0, 0, 1]]), 8).tolist()}
+        if 'cluster' in v:
+            view['cluster'] = v['cluster']
+        cameras['views'].append(view)
         poses[v['name']] = {'qvec': qvec.tolist(),
                             'tvec': np.round(tvec, 6).tolist(),
                             'R': np.round(R_w2c, 8).tolist(),
@@ -470,15 +672,21 @@ def write_outputs(built, ddir, args):
                    'per_room': args.samples_per_center,
                    'num_frames': len(built['views']),
                    'virtual': True,
-                   'rooms': built['rooms_out']}, f, indent=2)
+                   'sampler': built['sampler'],
+                   'rooms': built['rooms_out'],
+                   'extra_clusters': built['extra_clusters']}, f, indent=2)
     print('[gsplat-cam] %d views -> %s/{cameras,virtual_camera_poses,'
           'selection}.json' % (len(built['views']), out_dir))
     render_viewpoints_png(built['cage'], built['rooms_out'],
-                          os.path.join(out_dir, 'viewpoints.png'))
-    print('\nnext: copy point_cloud.ply + gsplat_render/cameras.json + '
+                          os.path.join(out_dir, 'viewpoints.png'),
+                          traj_xz=built['traj_xz'],
+                          extra_clusters=built['extra_clusters'])
+    print('\nnext: copy point_cloud.ply + %s/cameras.json + '
           'render_gsplat_panos.py to the CUDA machine and run\n'
           '  python render_gsplat_panos.py --ply point_cloud.ply '
-          '--cameras cameras.json --out renders/')
+          '--cameras cameras.json --out renders/\n'
+          'then copy renders/ back to %s/renders/'
+          % (args.out_name, args.out_name))
 
 
 def main():
@@ -494,16 +702,65 @@ def main():
     ap.add_argument('--split-area', type=float, default=12.0)
     ap.add_argument('--cell-area', type=float, default=9.0)
     ap.add_argument('--inside-min', type=float, default=0.90)
+    ap.add_argument('--sampler', choices=['grid', 'trajectory'],
+                    default='grid',
+                    help='grid: original CAGE-polygon sampler; trajectory: '
+                         'reachable viewpoints from the real sparse/0 camera '
+                         'track (per-room KMeans + DBSCAN missing-room '
+                         'clusters)')
+    ap.add_argument('--out-name', default=None,
+                    help='output subdir under dataset_dir (default '
+                         'gsplat_render for grid, gsplat_render_traj for '
+                         'trajectory)')
+    ap.add_argument('--plan-only', action='store_true',
+                    help='only write viewpoints_preview.png + '
+                         'selection_draft.json for confirmation')
+    ap.add_argument('--h-band', type=float, nargs=2, default=[0.9, 1.9],
+                    help='valid camera height band above the floor (m)')
+    ap.add_argument('--min-clusters', type=int, default=2,
+                    help='trajectory: floor on the per-room cluster count for '
+                         'rooms >= --min-cluster-area, so every non-trivial '
+                         'room carries >=2 viewpoint groups and can be '
+                         'split-tested by refine_cage_rooms (1 = area rule '
+                         'only, the pre-2026-07-28 behaviour)')
+    ap.add_argument('--min-cluster-area', type=float, default=2.0,
+                    help='room area (m2) above which --min-clusters applies')
+    ap.add_argument('--opening-clear', type=float, default=0.5,
+                    help='trajectory: prefer picks at least this far from the '
+                         'CAGE door/passage segments (a camera in a doorway '
+                         'predicts a layout spanning both rooms); relaxed per '
+                         'cluster when nothing qualifies. 0 disables')
+    ap.add_argument('--wall-clear', type=float, default=0.3,
+                    help='preferred min distance to CAGE walls when picking '
+                         'representatives (relaxed per cluster if none '
+                         'qualify)')
+    ap.add_argument('--boundary-margin', type=float, default=0.15,
+                    help='outside frames closer than this to any room '
+                         'boundary are treated as wall/door noise, not '
+                         'missing-room evidence')
+    ap.add_argument('--dbscan-eps', type=float, default=0.5)
+    ap.add_argument('--dbscan-min-samples', type=int, default=5)
+    ap.add_argument('--cluster-min-frames', type=int, default=30,
+                    help='min trajectory frames for a missing-room cluster')
+    ap.add_argument('--cluster-min-hull', type=float, default=1.5,
+                    help='min convex-hull area (m2) for a missing-room '
+                         'cluster')
     ap.add_argument('--verify', action='store_true',
                     help='regenerate in memory and compare against the copied '
-                         'gsplat_render jsons; never writes files')
+                         'gsplat_render jsons; never writes files '
+                         '(trajectory sampler: meta-only)')
     ap.add_argument('--force', action='store_true',
-                    help='allow overwriting existing gsplat_render jsons')
+                    help='allow overwriting existing output jsons')
     args = ap.parse_args()
+    if args.out_name is None:
+        args.out_name = ('gsplat_render' if args.sampler == 'grid'
+                         else 'gsplat_render_traj')
 
     built = build_all(args)
     if args.verify:
         verify(built, args.dataset_dir)
+    elif args.plan_only:
+        write_plan_only(built, args.dataset_dir, args)
     else:
         write_outputs(built, args.dataset_dir, args)
 

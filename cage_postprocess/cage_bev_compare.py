@@ -90,6 +90,28 @@ def to_poly(xz):
     return p
 
 
+def frame_ring(name, infer_dir, poses, floor_y, max_radius=12.0,
+               curve='manhattan', undo_vp=True):
+    '''One frame -> (world plan polygon xz [N,2], diag dict), or (None, None)
+    if the pose or the npz is missing. Module-level so refine_cage_rooms.py
+    can reuse the exact BEV chain; main() wraps it for stats bookkeeping.'''
+    npz_path = os.path.join(infer_dir, '%s_layout.npz' % name)
+    if name not in poses or not os.path.isfile(npz_path):
+        return None, None
+    z = np.load(npz_path)
+    R_undo, angle, vert = undo_vp_rotation(z['vp'])
+    if not undo_vp:
+        R_undo = np.eye(3)
+    C = np.asarray(poses[name]['camera_center'], dtype=np.float64)
+    R_c2w = np.asarray(poses[name]['R'], dtype=np.float64).T
+    h_cam = floor_y - C[1]
+    key_xyz = 'processed_xyz' if curve == 'manhattan' else 'raw_xyz'
+    xz = corners_world_xz(z[key_xyz], R_undo, R_c2w, C, h_cam, max_radius)
+    diag = {'angle': angle, 'vert': vert, 'ratio': float(z['ratio']),
+            'h_cam': h_cam, 'C': C, 'R_undo': R_undo, 'R_c2w': R_c2w}
+    return xz, diag
+
+
 def room_metrics(union_ring, cage_polys, rid):
     '''IoU / overflow / coverage of one room's union vs its CAGE polygon.
     (identical to the uLayout version)'''
@@ -118,7 +140,8 @@ def room_metrics(union_ring, cage_polys, rid):
             'overflow_outside_m2': round(max(outside_all, 0.0), 2)}
 
 
-def render_overlay(cage, sel, ring_polys, cams_all, out_path):
+def render_overlay(cage, sel, ring_polys, cams_all, out_path,
+                   extra_rings=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -150,6 +173,23 @@ def render_overlay(cage, sel, ring_polys, cams_all, out_path):
                     mew=0.5, zorder=5)
             ax.annotate(fr['frame'], fr['xz'], fontsize=6, color='0.3',
                         zorder=6, xytext=(3, 3), textcoords='offset points')
+    for cl in sel.get('extra_clusters', []):
+        hull = np.asarray(cl['hull_xz'])
+        ax.plot(*np.vstack([hull, hull[:1]]).T, color='0.25', lw=1.6,
+                ls='--', zorder=4)
+        hc = hull.mean(axis=0)
+        ax.text(hc[0], hc[1], cl['id'], color='0.15', fontsize=13,
+                fontweight='bold', ha='center', va='center', zorder=6)
+        for fr in cl['frames']:
+            key = (cl['id'], fr['frame'])
+            if extra_rings and key in extra_rings:
+                for xz in extra_rings[key]:
+                    ax.plot(*np.vstack([xz, xz[:1]]).T, color='0.35', lw=1.0,
+                            alpha=0.9, zorder=4)
+            ax.plot(fr['xz'][0], fr['xz'][1], 's', color='0.4', ms=5,
+                    mec='k', mew=0.5, zorder=5)
+            ax.annotate(fr['frame'], fr['xz'], fontsize=6, color='0.3',
+                        zorder=6, xytext=(3, 3), textcoords='offset points')
     ax.set_aspect('equal')
     ax.invert_yaxis()          # top-down view: match the CAGE floorplan PNGs
     ax.set_xlabel('world X (m)')
@@ -162,8 +202,8 @@ def render_overlay(cage, sel, ring_polys, cams_all, out_path):
     print('[bev] overlay -> %s' % out_path)
 
 
-def debug_project(name, infer_dir, R_undo, R_c2w, C, h_cam, cage, sel, ddir,
-                  out_dir):
+def debug_project(name, infer_dir, R_undo, R_c2w, C, h_cam, cage, sel,
+                  render_dir, out_dir):
     '''Decisive convention check: project the frame's own CAGE room polygon
     through the FORWARD chain onto the leveled pano and draw the wall lines.
     They must coincide with the visible wall/floor junctions.'''
@@ -181,9 +221,9 @@ def debug_project(name, infer_dir, R_undo, R_c2w, C, h_cam, cage, sel, ddir,
             pts.append(a + (b - a) * t)
     pts = np.asarray(pts)
     meta = json.load(open(os.path.join(
-        ddir, 'gsplat_render', 'virtual_camera_poses.json')))['metadata']
+        render_dir, 'virtual_camera_poses.json')))['metadata']
     img = np.array(Image.open(
-        os.path.join(ddir, 'gsplat_render', 'renders', name + '.png'))
+        os.path.join(render_dir, 'renders', name + '.png'))
         .resize((1024, 512), Image.Resampling.BICUBIC))[..., :3].copy()
     # the model saw the LEVELED pano; re-level with the SAME cached vp
     from inference import preprocess
@@ -210,12 +250,24 @@ def debug_project(name, infer_dir, R_undo, R_c2w, C, h_cam, cage, sel, ddir,
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dataset_dir', default='src/datasets/huizhongbeili-106')
+    ap.add_argument('--render_dir', default=None,
+                    help='gsplat render dir holding selection/poses/cameras '
+                         'jsons (default: index.json[render_dir] of the '
+                         'infer dir, else <dataset_dir>/gsplat_render)')
     ap.add_argument('--infer_dir', default=None,
                     help='infer_gsplat_panos.py output dir (default '
                          'src/output/<scene>/gsplat_infer_mp3d)')
     ap.add_argument('--out', default=None,
                     help='output dir (default <infer_dir>/../bev_compare_'
                          'gsplat_<tag from infer index.json>)')
+    ap.add_argument('--cage_json', default=None,
+                    help='explicit CAGE polys json (default: basename of '
+                         'selection.json[cage_json] under <dataset_dir>/'
+                         'floorplan; use the refined json to re-score)')
+    ap.add_argument('--selection', default=None,
+                    help='explicit selection json (default '
+                         '<render_dir>/selection.json; use '
+                         'refined_selection.json after refine_cage_rooms)')
     ap.add_argument('--curve', choices=['manhattan', 'raw'], default='manhattan',
                     help='manhattan corners (processed_xyz) or the raw '
                          '256-point boundary (raw_xyz)')
@@ -234,18 +286,25 @@ def main():
                                                'gsplat_infer_mp3d')
     index = json.load(open(os.path.join(infer_dir, 'index.json')))
     tag = index.get('tag', 'mp3d')
+    render_dir = (args.render_dir or index.get('render_dir')
+                  or os.path.join(ddir, 'gsplat_render'))
+    rd_base = os.path.basename(os.path.normpath(render_dir))
+    suffix = ('' if rd_base == 'gsplat_render'
+              else '_' + rd_base.replace('gsplat_render_', ''))
     out_dir = args.out or os.path.join(os.path.dirname(infer_dir.rstrip('/')),
-                                       'bev_compare_gsplat_%s' % tag)
+                                       'bev_compare_gsplat_%s%s'
+                                       % (tag, suffix))
     os.makedirs(out_dir, exist_ok=True)
 
-    sel = json.load(open(os.path.join(ddir, 'gsplat_render', 'selection.json')))
-    cage_json = os.path.join(ddir, 'floorplan',
-                             os.path.basename(sel['cage_json']))
+    sel_path = args.selection or os.path.join(render_dir, 'selection.json')
+    sel = json.load(open(sel_path))
+    cage_json = args.cage_json or os.path.join(
+        ddir, 'floorplan', os.path.basename(sel['cage_json']))
     cage = cc.load_cage(cage_json)
-    pdata = json.load(open(os.path.join(ddir, 'gsplat_render',
+    pdata = json.load(open(os.path.join(render_dir,
                                         'virtual_camera_poses.json')))
     poses, meta = pdata['poses'], pdata['metadata']
-    cam_meta = json.load(open(os.path.join(ddir, 'gsplat_render',
+    cam_meta = json.load(open(os.path.join(render_dir,
                                            'cameras.json')))['meta']
     theta = float(meta['theta_deg'])
     assert abs(theta - float(cam_meta['theta_deg'])) < 1e-6, \
@@ -255,51 +314,53 @@ def main():
           % (scene, len(cage['rooms_xz']), len(index['frames']), theta, tag))
 
     cage_polys = [to_poly(xz) for xz in cage['rooms_xz']]
-    key_xyz = 'processed_xyz' if args.curve == 'manhattan' else 'raw_xyz'
 
-    ring_polys, metrics = {}, []
+    ring_polys, extra_rings, metrics = {}, {}, []
     angles, vert_dots, ceil_errs = [], [], []
     n_cam_outside = 0
-    debug_left = args.debug_project
+    state = {'debug_left': args.debug_project}
+
+    def bev_frame(name, debug_room_sel=None):
+        '''One frame -> world plan polygon xz [N,2], or None if missing.'''
+        from shapely.geometry import Point
+        xz, diag = frame_ring(name, infer_dir, poses, floor_y,
+                              max_radius=args.max_radius, curve=args.curve,
+                              undo_vp=not args.no_undo_vp)
+        if xz is None:
+            return None
+        angles.append(diag['angle'])
+        vert_dots.append(diag['vert'])
+        if diag['angle'] > 5.0:
+            print('[bev]   warn: %s residual VP rotation %.1f deg'
+                  % (name, diag['angle']))
+        C, h_cam = diag['C'], diag['h_cam']
+        ceil_errs.append(diag['ratio'] * h_cam - (C[1] - ceil_y))
+        nonlocal n_cam_outside
+        if not to_poly(xz).contains(Point(C[0], C[2])):
+            n_cam_outside += 1
+        if state['debug_left'] > 0 and debug_room_sel is not None:
+            debug_project(name, infer_dir, diag['R_undo'], diag['R_c2w'], C,
+                          h_cam, cage, debug_room_sel, render_dir, out_dir)
+            state['debug_left'] -= 1
+        return xz
+
     for room in sel['rooms']:
         rid = room['id']
         shp = []
         for fr in room['frames']:
-            name = fr['frame']
-            npz_path = os.path.join(infer_dir, '%s_layout.npz' % name)
-            if name not in poses or not os.path.isfile(npz_path):
-                print('[bev]   room %d: missing pose/npz for %s' % (rid, name))
+            xz = bev_frame(fr['frame'], debug_room_sel=sel)
+            if xz is None:
+                print('[bev]   room %d: missing pose/npz for %s'
+                      % (rid, fr['frame']))
                 continue
-            z = np.load(npz_path)
-            R_undo, angle, vert = undo_vp_rotation(z['vp'])
-            if args.no_undo_vp:
-                R_undo = np.eye(3)
-            angles.append(angle)
-            vert_dots.append(vert)
-            if angle > 5.0:
-                print('[bev]   warn: %s residual VP rotation %.1f deg'
-                      % (name, angle))
-
-            C = np.asarray(poses[name]['camera_center'], dtype=np.float64)
-            R_c2w = np.asarray(poses[name]['R'], dtype=np.float64).T
-            h_cam = floor_y - C[1]
-            ceil_errs.append(float(z['ratio']) * h_cam - (C[1] - ceil_y))
-
-            xz = corners_world_xz(z[key_xyz], R_undo, R_c2w, C, h_cam,
-                                  args.max_radius)
-            p = to_poly(xz)
-            from shapely.geometry import Point
-            if not p.contains(Point(C[0], C[2])):
-                n_cam_outside += 1
-            ring_polys[(rid, name)] = [xz]
-            shp.append(p)
-
-            if debug_left > 0:
-                debug_project(name, infer_dir, R_undo, R_c2w, C, h_cam, cage,
-                              sel, ddir, out_dir)
-                debug_left -= 1
+            ring_polys[(rid, fr['frame'])] = [xz]
+            shp.append(to_poly(xz))
         if not shp:
-            metrics.append({'room': rid, 'error': 'no polygons'})
+            metrics.append({'room': rid,
+                            'no_coverage': room.get('no_coverage', False),
+                            'error': ('no trajectory coverage'
+                                      if room.get('no_coverage')
+                                      else 'no polygons')})
             continue
         from shapely.ops import unary_union
         union_ring = unary_union(shp)
@@ -310,6 +371,17 @@ def main():
                            for p in shp]}
         m.update(room_metrics(union_ring, cage_polys, rid))
         metrics.append(m)
+
+    # suspected missing rooms (trajectory clusters outside every CAGE room):
+    # predictions go to the overlay only -- there is no CAGE truth to score
+    for cl in sel.get('extra_clusters', []):
+        for fr in cl['frames']:
+            xz = bev_frame(fr['frame'])
+            if xz is not None:
+                extra_rings[(cl['id'], fr['frame'])] = [xz]
+        if cl['frames']:
+            print('[bev] missing-room cluster %s: %d views on overlay '
+                  '(no CAGE polygon, no IoU)' % (cl['id'], len(cl['frames'])))
 
     print('[bev] VP residual rotation: max %.2f deg, mean %.2f deg; '
           '|vp0.z|: min %.4f' % (max(angles), float(np.mean(angles)),
@@ -336,8 +408,8 @@ def main():
               % (m['room'], m['iou'], m['coverage'], m['overflow'],
                  m['ring_area_m2'], m['cage_area_m2'], into))
     ious = [m['iou'] for m in metrics if 'iou' in m]
-    print('[bev] mean IoU %.3f over %d rooms' % (float(np.mean(ious)),
-                                                 len(ious)))
+    print('[bev] mean IoU %.3f over %d/%d covered rooms'
+          % (float(np.mean(ious)), len(ious), len(sel['rooms'])))
 
     out_json = os.path.join(out_dir, 'bev_metrics.json')
     with open(out_json, 'w') as f:
@@ -349,13 +421,18 @@ def main():
                                      'max_abs': round(float(np.max(
                                          np.abs(ceil_errs))), 4)},
                    'mean_iou': round(float(np.mean(ious)), 3),
+                   'covered_rooms': len(ious),
+                   'total_rooms': len(sel['rooms']),
+                   'extra_clusters': [c['id'] for c
+                                      in sel.get('extra_clusters', [])],
                    'rooms': metrics}, f, indent=2)
     print('[bev] metrics -> %s' % out_json)
 
     cams_all = np.array([[p['camera_center'][0], p['camera_center'][2]]
                          for p in poses.values()])
     render_overlay(cage, sel, ring_polys, cams_all,
-                   os.path.join(out_dir, 'bev_overlay.png'))
+                   os.path.join(out_dir, 'bev_overlay.png'),
+                   extra_rings=extra_rings)
 
 
 if __name__ == '__main__':

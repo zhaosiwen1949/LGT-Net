@@ -50,6 +50,10 @@ from inference import preprocess, visualize_2d
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--dataset_dir', default='src/datasets/huizhongbeili-106')
+    ap.add_argument('--render_dir', default=None,
+                    help='gsplat render dir (default <dataset_dir>/'
+                         'gsplat_render; use .../gsplat_render_traj for the '
+                         'trajectory-sampled set)')
     ap.add_argument('--cfg', default='src/config/mp3d.yaml')
     ap.add_argument('--ckpt', default=None,
                     help='explicit checkpoint .pkl (bypasses the ckpt-dir '
@@ -78,8 +82,13 @@ def main():
 
     scene = os.path.basename(os.path.normpath(args.dataset_dir))
     tag = config.TAG
+    render_dir = args.render_dir or os.path.join(args.dataset_dir,
+                                                 'gsplat_render')
+    rd_base = os.path.basename(os.path.normpath(render_dir))
+    suffix = ('' if rd_base == 'gsplat_render'
+              else '_' + rd_base.replace('gsplat_render_', ''))
     out_dir = args.out or os.path.join('src', 'output', scene,
-                                       'gsplat_infer_%s' % tag)
+                                       'gsplat_infer_%s%s' % (tag, suffix))
     os.makedirs(out_dir, exist_ok=True)
 
     model, _, _, _ = build_model(config, logger)
@@ -90,18 +99,17 @@ def main():
         logger.info('Overrode weights from %s' % args.ckpt)
     model.eval()
 
-    renders = sorted(glob.glob(os.path.join(args.dataset_dir, 'gsplat_render',
-                                            'renders', '*.png')))
+    renders = sorted(glob.glob(os.path.join(render_dir, 'renders', '*.png')))
     if args.limit:
         renders = renders[:args.limit]
     if not renders:
-        raise SystemExit('no renders under %s/gsplat_render/renders'
-                         % args.dataset_dir)
+        raise SystemExit('no renders under %s/renders' % render_dir)
     print('[infer] %d rendered panos -> %s (cfg %s, tag %s)'
           % (len(renders), out_dir, args.cfg, tag))
 
     index = {'cfg': args.cfg, 'ckpt_override': args.ckpt, 'tag': tag,
-             'dataset_dir': args.dataset_dir, 'frames': {}}
+             'dataset_dir': args.dataset_dir, 'render_dir': render_dir,
+             'frames': {}}
     t0 = time.time()
     with torch.no_grad():
         for i, path in enumerate(renders):
